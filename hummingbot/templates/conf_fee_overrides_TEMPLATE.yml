@@ -21,6 +21,20 @@ binance_maker_percent_fee:  # 0.75
 binance_taker_percent_fee:  # 0.75
 binance_buy_percent_fee_deducted_from_returns:  # True
 
+foxbit_percent_fee_token:
+foxbit_maker_percent_fee:
+foxbit_taker_percent_fee:
+foxbit_buy_percent_fee_deducted_from_returns:
+foxbit_maker_fixed_fees:
+foxbit_taker_fixed_fees:
+
+cainvest_spot_percent_fee_token:
+cainvest_spot_maker_percent_fee:
+cainvest_spot_taker_percent_fee:
+cainvest_spot_buy_percent_fee_deducted_from_returns:
+cainvest_spot_maker_fixed_fees:
+cainvest_spot_taker_fixed_fees:
+
 # List of supported Exchanges for which the user's conf/conf_fee_override.yml
 # will work. This file currently needs to be in sync with hummingbot list of
 # supported exchanges

@@ -226,7 +226,8 @@ class FoxbitExchange(ExchangePyBase):
         :param price: the order price
         :return: the estimated fee for the order
         """
-        return DeductedFromReturnsTradeFee(percent=self.estimate_fee_pct(False))
+        is_maker_order = is_maker if is_maker is not None else order_type.is_limit_type()
+        return DeductedFromReturnsTradeFee(percent=self.estimate_fee_pct(is_maker_order))
 
     def buy(self,
             trading_pair: str,

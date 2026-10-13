@@ -11,6 +11,8 @@ from hummingbot.core.event.events import (
     BuyOrderCompletedEvent,
     BuyOrderCreatedEvent,
     MarketOrderFailureEvent,
+    OrderCancelledEvent,
+    OrderFilledEvent,
     SellOrderCompletedEvent,
     SellOrderCreatedEvent,
 )
@@ -56,8 +58,13 @@ class XEMMExecutor(ExecutorBase):
         return same_token_condition or tokens_interchangeable_condition or stable_coins_condition
 
     def is_arbitrage_valid(self, pair1, pair2):
-        base_asset1, _ = split_hb_trading_pair(pair1)
-        base_asset2, _ = split_hb_trading_pair(pair2)
+        base_asset1, quote_asset1 = split_hb_trading_pair(pair1)
+        base_asset2, quote_asset2 = split_hb_trading_pair(pair2)
+        # Same two assets, possibly inverted base/quote (e.g. OKX BRL1-USDT vs Cainvest USDT-BRL1).
+        if frozenset((base_asset1.upper(), quote_asset1.upper())) == frozenset(
+            (base_asset2.upper(), quote_asset2.upper())
+        ):
+            return True
         return self._are_tokens_interchangeable(base_asset1, base_asset2)
 
     def __init__(self, strategy: StrategyV2Base, config: XEMMExecutorConfig, update_interval: float = 1.0,
@@ -98,9 +105,14 @@ class XEMMExecutor(ExecutorBase):
         self._current_trade_profitability = Decimal("0")
         self.maker_order = None
         self.taker_order = None
+        self.taker_orders: Dict[str, TrackedOrder] = {}
         self.failed_orders = []
         self._current_retries = 0
         self._max_retries = max_retries
+        self._maker_cancel_in_flight = False
+        self._filled_maker_base_amount = Decimal("0")
+        self._hedged_maker_base_amount = Decimal("0")
+        self._pending_taker_order_amounts: Dict[str, Decimal] = {}
         super().__init__(strategy=strategy,
                          connectors=[config.buying_market.connector_name, config.selling_market.connector_name],
                          config=config, update_interval=update_interval)
@@ -111,7 +123,7 @@ class XEMMExecutor(ExecutorBase):
         maker_order_candidate = OrderCandidate(
             trading_pair=self.maker_trading_pair,
             is_maker=True,
-            order_type=OrderType.LIMIT,
+            order_type=OrderType.LIMIT_MAKER,
             order_side=self.maker_order_side,
             amount=self.config.order_amount,
             price=mid_price,)
@@ -172,7 +184,7 @@ class XEMMExecutor(ExecutorBase):
         maker_fee_task = asyncio.create_task(self.get_tx_cost_in_asset(
             exchange=self.maker_connector,
             trading_pair=self.maker_trading_pair,
-            order_type=OrderType.LIMIT,
+            order_type=OrderType.LIMIT_MAKER,
             is_buy=self.maker_order_side == TradeType.BUY,
             order_amount=self.config.order_amount,
             asset=base_without_wrapped
@@ -218,28 +230,34 @@ class XEMMExecutor(ExecutorBase):
         order_id = self.place_order(
             connector_name=self.maker_connector,
             trading_pair=self.maker_trading_pair,
-            order_type=OrderType.LIMIT,
+            order_type=OrderType.LIMIT_MAKER,
             side=self.maker_order_side,
             amount=self.config.order_amount,
             price=self._maker_target_price)
         self.maker_order = TrackedOrder(order_id=order_id)
+        self._maker_cancel_in_flight = False
         self.logger().info(f"Created maker order {order_id} at price {self._maker_target_price}.")
 
     async def control_shutdown_process(self):
-        if self.maker_order.is_done and self.taker_order.is_done:
+        maker_done = self.maker_order is not None and self.maker_order.is_done
+        takers_done = all(order.is_done for order in self.taker_orders.values())
+        hedge_complete = self._hedged_maker_base_amount >= self._filled_maker_base_amount
+        if maker_done and takers_done and hedge_complete:
             self.logger().info("Both orders are done, executor terminated.")
             self.stop()
 
     async def control_update_maker_order(self):
         await self.update_current_trade_profitability()
         if self._current_trade_profitability - self._tx_cost_pct < self.config.min_profitability:
-            self.logger().info(f"Order {self.maker_order.order_id} profitability {self._current_trade_profitability - self._tx_cost_pct} is below minimum profitability {self.config.min_profitability}. Cancelling order.")
-            self._strategy.cancel(self.maker_connector, self.maker_trading_pair, self.maker_order.order_id)
-            self.maker_order = None
+            if not self._maker_cancel_in_flight:
+                self.logger().info(f"Order {self.maker_order.order_id} profitability {self._current_trade_profitability - self._tx_cost_pct} is below minimum profitability {self.config.min_profitability}. Cancelling order.")
+                self._strategy.cancel(self.maker_connector, self.maker_trading_pair, self.maker_order.order_id)
+                self._maker_cancel_in_flight = True
         elif self._current_trade_profitability - self._tx_cost_pct > self.config.max_profitability:
-            self.logger().info(f"Order {self.maker_order.order_id} profitability {self._current_trade_profitability - self._tx_cost_pct} is above maximum profitability {self.config.max_profitability}. Cancelling order.")
-            self._strategy.cancel(self.maker_connector, self.maker_trading_pair, self.maker_order.order_id)
-            self.maker_order = None
+            if not self._maker_cancel_in_flight:
+                self.logger().info(f"Order {self.maker_order.order_id} profitability {self._current_trade_profitability - self._tx_cost_pct} is above maximum profitability {self.config.max_profitability}. Cancelling order.")
+                self._strategy.cancel(self.maker_connector, self.maker_trading_pair, self.maker_order.order_id)
+                self._maker_cancel_in_flight = True
 
     async def update_current_trade_profitability(self):
         trade_profitability = Decimal("0")
@@ -269,37 +287,79 @@ class XEMMExecutor(ExecutorBase):
         if self.maker_order and event.order_id == self.maker_order.order_id:
             self.logger().info(f"Maker order {event.order_id} created.")
             self.maker_order.order = self.get_in_flight_order(self.maker_connector, event.order_id)
-        elif self.taker_order and event.order_id == self.taker_order.order_id:
+        elif event.order_id in self.taker_orders:
             self.logger().info(f"Taker order {event.order_id} created.")
-            self.taker_order.order = self.get_in_flight_order(self.taker_connector, event.order_id)
+            self.taker_orders[event.order_id].order = self.get_in_flight_order(self.taker_connector, event.order_id)
+
+    def process_order_filled_event(self, _, market, event: OrderFilledEvent):
+        if self.maker_order and event.order_id == self.maker_order.order_id:
+            self._filled_maker_base_amount += event.amount
+            amount_to_hedge = self._filled_maker_base_amount - self._hedged_maker_base_amount
+            if amount_to_hedge > Decimal("0"):
+                self.logger().info(
+                    f"Maker fill detected for order {event.order_id}. "
+                    f"Hedging filled amount {amount_to_hedge} on taker."
+                )
+                self.place_taker_order(amount=amount_to_hedge)
+                self._hedged_maker_base_amount += amount_to_hedge
+        elif event.order_id in self.taker_orders:
+            self.taker_orders[event.order_id].order = self.get_in_flight_order(self.taker_connector, event.order_id)
 
     def process_order_completed_event(self,
                                       event_tag: int,
                                       market: ConnectorBase,
                                       event: Union[BuyOrderCompletedEvent, SellOrderCompletedEvent]):
         if self.maker_order and event.order_id == self.maker_order.order_id:
-            self.logger().info(f"Maker order {event.order_id} completed. Executing taker order.")
-            self.place_taker_order()
+            self.maker_order.order = self.get_in_flight_order(self.maker_connector, event.order_id)
+            maker_executed_base = self.maker_order.executed_amount_base
+            remaining_to_hedge = maker_executed_base - self._hedged_maker_base_amount
+            if remaining_to_hedge > Decimal("0"):
+                self.logger().info(
+                    f"Maker order {event.order_id} completed with unhedged amount {remaining_to_hedge}. "
+                    f"Executing final taker hedge."
+                )
+                self.place_taker_order(amount=remaining_to_hedge)
+                self._hedged_maker_base_amount += remaining_to_hedge
             self._status = RunnableStatus.SHUTTING_DOWN
+        elif event.order_id in self.taker_orders:
+            self.taker_orders[event.order_id].order = self.get_in_flight_order(self.taker_connector, event.order_id)
+            self._pending_taker_order_amounts.pop(event.order_id, None)
 
-    def place_taker_order(self):
+    def place_taker_order(self, amount: Decimal):
+        if amount <= Decimal("0"):
+            return
         taker_order_id = self.place_order(
             connector_name=self.taker_connector,
             trading_pair=self.taker_trading_pair,
             order_type=OrderType.MARKET,
             side=self.taker_order_side,
-            amount=self.config.order_amount)
-        self.taker_order = TrackedOrder(order_id=taker_order_id)
+            amount=amount)
+        tracked_taker_order = TrackedOrder(order_id=taker_order_id)
+        self.taker_order = tracked_taker_order
+        self.taker_orders[taker_order_id] = tracked_taker_order
+        self._pending_taker_order_amounts[taker_order_id] = amount
 
     def process_order_failed_event(self, _, market, event: MarketOrderFailureEvent):
         if self.maker_order and self.maker_order.order_id == event.order_id:
             self.failed_orders.append(self.maker_order)
             self.maker_order = None
+            self._maker_cancel_in_flight = False
             self._current_retries += 1
-        elif self.taker_order and self.taker_order.order_id == event.order_id:
-            self.failed_orders.append(self.taker_order)
+        elif event.order_id in self.taker_orders:
+            failed_taker_order = self.taker_orders[event.order_id]
+            self.failed_orders.append(failed_taker_order)
             self._current_retries += 1
-            self.place_taker_order()
+            retry_amount = self._pending_taker_order_amounts.get(event.order_id, Decimal("0"))
+            self._pending_taker_order_amounts.pop(event.order_id, None)
+            if retry_amount > Decimal("0"):
+                self.place_taker_order(amount=retry_amount)
+
+    def process_order_canceled_event(self, _, market: ConnectorBase, event: OrderCancelledEvent):
+        if self.maker_order and event.order_id == self.maker_order.order_id:
+            self.maker_order = None
+            self._maker_cancel_in_flight = False
+        elif event.order_id in self.taker_orders:
+            self._pending_taker_order_amounts.pop(event.order_id, None)
 
     def get_custom_info(self) -> Dict:
         # Since we can't make this method async, we'll skip the profitability calculation
@@ -320,6 +380,8 @@ class XEMMExecutor(ExecutorBase):
             "maker_target_price": self._maker_target_price,
             "net_profitability": self._current_trade_profitability - self._tx_cost_pct,
             "order_amount": self.config.order_amount,
+            "maker_filled_base": self._filled_maker_base_amount,
+            "maker_hedged_base": self._hedged_maker_base_amount,
         }
 
     def early_stop(self, keep_position: bool = False):
@@ -330,15 +392,16 @@ class XEMMExecutor(ExecutorBase):
         self.stop()
 
     def get_cum_fees_quote(self) -> Decimal:
-        if self.is_closed and self.maker_order and self.taker_order:
-            return self.maker_order.cum_fees_quote + self.taker_order.cum_fees_quote
+        if self.is_closed and self.maker_order:
+            return self.maker_order.cum_fees_quote + sum(order.cum_fees_quote for order in self.taker_orders.values())
         else:
             return Decimal("0")
 
     def get_net_pnl_quote(self) -> Decimal:
-        if self.is_closed and self.maker_order and self.taker_order and self.maker_order.is_done and self.taker_order.is_done:
+        takers_done = all(order.is_done for order in self.taker_orders.values())
+        if self.is_closed and self.maker_order and self.maker_order.is_done and takers_done:
             maker_pnl = self.maker_order.executed_amount_base * self.maker_order.average_executed_price
-            taker_pnl = self.taker_order.executed_amount_base * self.taker_order.average_executed_price
+            taker_pnl = sum(order.executed_amount_base * order.average_executed_price for order in self.taker_orders.values())
             return taker_pnl - maker_pnl - self.get_cum_fees_quote()
         else:
             return Decimal("0")
